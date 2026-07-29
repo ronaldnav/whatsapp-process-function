@@ -90,7 +90,7 @@ if (-not ($settingsToApply -contains "PROCESS_POISON_QUEUE_NAME=$poisonQueueName
 $adobeSslValidation = if ($config.Values.ADOBE_DISABLE_SSL_VALIDATION) {
     [string]$config.Values.ADOBE_DISABLE_SSL_VALIDATION
 } else {
-    "true"
+    "false"
 }
 
 if (-not ($settingsToApply -contains "ADOBE_DISABLE_SSL_VALIDATION=$adobeSslValidation")) {

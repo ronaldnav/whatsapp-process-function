@@ -6,10 +6,9 @@ Especificación funcional y técnica para implementar este proyecto desde cero. 
 reenvía a dos endpoints de Adobe (CDP Audience, AJO Webhook), respetando un límite de 30 TPS por
 endpoint.
 
-A diferencia de `SPEC.md` del proyecto hermano (que documenta un proyecto ya implementado, incluido
-su código fuente completo), este documento es un **spec de diseño previo a la implementación** —
-por eso incluye una sección explícita de decisiones/asunciones que hay que confirmar antes de
-escribir código, en vez de un apéndice de código fuente.
+Documenta la arquitectura, contratos, configuración y pasos necesarios para implementar y
+desplegar este proyecto sobre la infraestructura ya provisionada (`fnctdemolab02`, ver
+`doc/guia-poc-subnet-nsg-webhook-whatsapp.md` del proyecto hermano `whatsapp-webhook-function`).
 
 ---
 
@@ -32,7 +31,7 @@ escribir código, en vez de un apéndice de código fuente.
 ### 2.1 Entrada — Queue Trigger sobre `demolab-queue`
 
 ```java
-@FunctionName("EventDispatcher")
+@FunctionName("WhatsAppProcess")
 public void run(
         @QueueTrigger(name = "message",
                       queueName = "%QUEUE_NAME%",
@@ -47,8 +46,9 @@ public void run(
   proyecto hermano).
 - `message` es el JSON crudo de WhatsApp tal cual lo dejó Function 1 (sin transformar,
   sin re-serializar).
-- El host mueve automáticamente a `demolab-queue-poison` los mensajes que superen
-  `maxDequeueCount` (`host.json`, default 5) — no hay que implementar un dead-letter propio.
+- Los mensajes que fallan van a una poison queue propia (`demolab-process-poison-queue`, ver §5) —
+  la Function captura el fallo y completa el mensaje original en el primer intento; no depende del
+  dead-letter nativo (`maxDequeueCount`).
 
 ### 2.2 Salida — POST a dos endpoints Adobe
 
@@ -67,9 +67,10 @@ Por cada mensaje, dos llamadas HTTP `POST` independientes:
 2. Adquirir permiso del rate limiter de AJO (independiente del de CDP) → POST a
    ADOBE_AJO_WEBHOOK_ENDPOINT con header Authorization/API key = AdobeAjoWebhookApiKey.
 3. Cada envío se reintenta independientemente ante fallas transitorias (ver §5).
-4. Si, tras agotar reintentos, CUALQUIERA de los dos envíos falla → se relanza la excepción desde
-   la function → Azure NO completa el mensaje → vuelve a la cola para reintento (hasta
-   maxDequeueCount, luego poison). Ver decisión D3 en §9.
+4. Si, tras agotar reintentos, CUALQUIERA de los dos envíos falla → la Function captura la
+   excepción y escribe el mensaje en la poison queue propia (`demolab-process-poison-queue`); el
+   mensaje original se completa (se remueve de `demolab-queue`) en ese mismo intento — no hay
+   reintento automático de plataforma.
 ```
 
 ### 2.3 Resumen de comportamiento
@@ -77,10 +78,8 @@ Por cada mensaje, dos llamadas HTTP `POST` independientes:
 | Escenario | Resultado |
 |---|---|
 | Ambos envíos exitosos | Mensaje completado (removido de la cola) |
-| CDP falla tras reintentos, AJO exitoso | Excepción → mensaje vuelve a la cola completo (reintenta ambos envíos) |
-| AJO falla tras reintentos, CDP exitoso | Igual que arriba |
+| CDP o AJO falla tras agotar reintentos (cualquiera de los dos, o ambos) | Mensaje se completa en `demolab-queue` (no se reintenta) y se escribe en `demolab-process-poison-queue` |
 | Rate limit alcanzado en cualquier endpoint | La invocación espera (backpressure), no descarta ni falla |
-| Mensaje supera `maxDequeueCount` | Azure lo mueve a `demolab-queue-poison` automáticamente |
 
 ---
 
@@ -91,7 +90,7 @@ Azure Storage Queue (demolab-queue, stgdemolabv2)
       │  Queue Trigger (connection = QueueStorage, identity-based)
       ▼
 ┌───────────────────────────────┐
-│ EventDispatcherFunction        │  ← Queue Trigger, Java 21
+│ WhatsAppProcessFunction        │  ← Queue Trigger, Java 21
 │  (Azure Function)              │
 ├───────────────────────────────┤
 │ SecretCache                    │──► Azure Key Vault (kvdemolabv2, vía Managed Identity)
@@ -116,12 +115,12 @@ No se anticipa un paquete `security/` equivalente al de Function 1 (no hay verif
 en este proyecto) — si el mapeo de payload a los esquemas de CDP/AJO requiere lógica no trivial,
 considerar un paquete `mapping/` adicional (ver decisión D1 en §9).
 
-### 3.2 `EventDispatcherFunction` (entry point)
+### 3.2 `WhatsAppProcessFunction` (entry point)
 
-- `@FunctionName("EventDispatcher")`, `@QueueTrigger` (ver §2.1).
+- `@FunctionName("WhatsAppProcess")`, `@QueueTrigger` (ver §2.1).
 - Responsabilidades: leer las API keys vía `SecretCache`, delegar a `AdobeDispatchService` el envío
-  a ambos endpoints, dejar que las excepciones no controladas se propaguen (para que Azure
-  reintente el mensaje vía la semántica nativa de la cola).
+  a ambos endpoints, y capturar cualquier excepción para escribir el mensaje en la poison queue
+  propia (`@QueueOutput` a `PROCESS_POISON_QUEUE_NAME`) en vez de dejarla propagar.
 - No contiene lógica de rate limiting ni de construcción de requests — delega todo a
   `AdobeDispatchService`.
 
@@ -136,11 +135,19 @@ void dispatch(String rawEvent, String cdpApiKey, String ajoApiKey) throws Except
 Testeable con JUnit/Mockito inyectando un `HttpClient` (o wrapper) mockeado — sin necesidad de
 levantar el runtime de Azure Functions ni pegarle a Adobe real.
 
-### 3.4 `SecretCache` (idéntico diseño al de Function 1)
+### 3.4 `SecretCache` (mismo diseño que Function 1)
 
 Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed Identity, cache TTL
-10 min, fallback a env var en local) — reusar tal cual, cambiando únicamente los nombres de
-secreto/env var:
+10 min) — reusar tal cual, cambiando únicamente los nombres de secreto/env var. Orden de resolución
+(corregido 2026-07-29 para alinear con Function 1 §5.4):
+
+- Si `KEY_VAULT_URI` está seteada → se construye un `SecretClient` real y **Key Vault manda siempre**,
+  incluso si la env var también está presente (evita que una API key real quede "pegada" en un App
+  Setting sin que nadie lo note).
+- Si `KEY_VAULT_URI` no está seteada → modo local: **no se construye ningún `SecretClient`** (no se
+  intenta ninguna llamada de red) y se resuelve exclusivamente vía env var. Si la env var tampoco
+  está presente, se lanza `IllegalStateException` con un mensaje explícito de configuración
+  faltante, en vez de intentar conectar a un vault inexistente.
 
 | Env var (local) | Secret name en Key Vault |
 |---|---|
@@ -151,8 +158,8 @@ secreto/env var:
 
 ## 4. Rate limiting (30 TPS por endpoint, independientes)
 
-- Un rate limiter tipo token-bucket/leaky-bucket **por endpoint** (Resilience4j `RateLimiter` o
-  Guava `RateLimiter`) — uno para CDP, uno para AJO, cada uno leyendo su propio
+- Un rate limiter tipo token-bucket **por endpoint** (`TokenBucketRateLimiter` propio, sin
+  dependencias externas) — uno para CDP, uno para AJO, cada uno leyendo su propio
   `*_RATE_LIMIT_TPS` (default 30 si el App Setting no está presente).
 - El limiter debe **esperar/bloquear** (backpressure) cuando se supera el TPS configurado, nunca
   descartar el evento.
@@ -167,19 +174,18 @@ secreto/env var:
 
 ## 5. Resiliencia
 
-- **Reintentos**: backoff exponencial ante fallas transitorias (timeout, `5xx`) de cada endpoint,
-  independiente por endpoint. Número de intentos y backoff exacto: **decisión D2 en §9** (default
-  propuesto: 3 intentos, backoff 500ms/1s/2s).
+- **Reintentos**: backoff lineal ante fallas transitorias (timeout, `5xx`) de cada endpoint,
+  independiente por endpoint — `ADOBE_INITIAL_BACKOFF_MILLIS * intento`. Default: 3 intentos
+  (`ADOBE_MAX_ATTEMPTS`), backoff inicial 500ms (`ADOBE_INITIAL_BACKOFF_MILLIS`) →
+  500ms/1000ms/1500ms.
 - **Errores no reintentables** (`4xx` de Adobe, payload rechazado): no reintentar contra el mismo
   endpoint — loguear y tratar como fallo definitivo de ese envío.
-- **Mensaje que falla definitivamente**: no se completa manualmente ni se mueve a una cola propia —
-  se deja que la excepción se propague y Azure lo reintente vía la semántica nativa de
-  `demolab-queue` hasta `maxDequeueCount`, luego pasa automáticamente a `demolab-queue-poison`.
-- **Idempotencia**: como un mensaje puede reintentarse completo (§2.2 paso 4), un evento podría
-  reenviarse más de una vez a un endpoint que sí lo había aceptado en un intento previo (si el otro
-  endpoint fue el que falló). Confirmar con Adobe si CDP Audience / AJO Webhook toleran eventos
-  duplicados (idealmente sí, por `wamid` como clave natural) — si no, evaluar deduplicación antes
-  de reenviar.
+- **Mensaje que falla definitivamente**: se completa manualmente (se remueve de `demolab-queue`) y
+  se escribe en una poison queue propia (`demolab-process-poison-queue`) — no depende de
+  `maxDequeueCount`/`demolab-queue-poison` nativas.
+- **Idempotencia**: al no haber reintento de plataforma (§2.2 paso 4), un mensaje solo se procesa
+  una vez; si falla, va directo a la poison queue en vez de volver a intentarse contra el endpoint
+  que ya había tenido éxito.
 
 ---
 
@@ -194,6 +200,12 @@ secreto/env var:
   solo metadatos (ej. `wamid`, resultado HTTP, latencia).
 - **Function App sin acceso público** (`fnctdemolab02`, ya configurado) — solo se dispara por el
   trigger de cola, no expone ningún endpoint HTTP.
+- **`ADOBE_DISABLE_SSL_VALIDATION`**: cuando es `true`, `AdobeDispatchService` instala un
+  `X509TrustManager` permisivo que acepta cualquier certificado (necesario hoy porque los endpoints
+  configurados son mocks de Pipedream, §9 D1). El default de `set-function-app-settings.ps1` es
+  `false` (corregido 2026-07-29 — antes defaulteaba a `true` si el setting no estaba en
+  `local.settings.json`, empujando el modo inseguro por defecto en cada deploy). **Debe quedar en
+  `false`/ausente antes de apuntar a endpoints reales de Adobe.**
 
 ---
 
@@ -206,9 +218,9 @@ secreto/env var:
 | RBAC: `Storage Queue Data Contributor` + `Storage Blob Data Contributor` sobre `stgdemolabv2` | ✅ asignado |
 | RBAC: `Key Vault Secrets User` sobre `kvdemolabv2` | ✅ asignado |
 | VNet Integration a `subnet-function-outbound` (`vnedemolabv2`) | ✅ activa |
-| `Enable public access: Off` | ⚠️ estado objetivo — se togglea a `On` temporalmente para desplegar, ver §11.1 |
+| `Enable public access: Off` | ✅ revertido a `Disabled` (2026-07-29) — se togglea a `On` temporalmente para desplegar, ver §11.1 |
 | Cola `demolab-queue` en `stgdemolabv2` | ✅ existe |
-| Secretos `AdobeCdpAudienceApiKey` / `AdobeAjoWebhookApiKey` en `kvdemolabv2` | ❌ **falta crear** |
+| Secretos `AdobeCdpAudienceApiKey` / `AdobeAjoWebhookApiKey` en `kvdemolabv2` | ✅ creados (2026-07-29, valor placeholder `test-key` hasta contar con las API keys reales de Adobe) |
 | App Settings de este proyecto (§7.1) | ❌ **falta configurar** |
 
 ### 7.1 App Settings requeridos en `fnctdemolab02`
@@ -255,16 +267,16 @@ Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStora
 - **Java 21**, empaquetado `jar`.
 - `azure-functions-java-library` `3.3.0`
 - `azure-identity` `1.13.3` + `azure-security-keyvault-secrets` `4.9.1` (para `SecretCache`)
-- Rate limiting: **Resilience4j `resilience4j-ratelimiter`** (recomendado sobre Guava
-  `RateLimiter` por integrarse mejor con métricas/observabilidad si más adelante se agrega
-  Micrometer)
+- Rate limiting: `TokenBucketRateLimiter` propio (`AtomicLong` + `compareAndSet`, sin dependencias
+  externas) — un limiter independiente por endpoint.
 - Cliente HTTP: `java.net.http.HttpClient` (JDK 21, sin dependencia externa)
 - Test: `junit-jupiter` `5.10.2`, `mockito-core` + `mockito-junit-jupiter` `5.11.0`
 - Plugins de build (idénticos a Function 1):
   - `maven-compiler-plugin` (release 21)
   - `maven-surefire-plugin` — inyecta `ADOBE_CDP_AUDIENCE_API_KEY=test-key` /
-    `ADOBE_AJO_WEBHOOK_API_KEY=test-key` como env vars de test, para forzar el fallback local de
-    `SecretCache` sin depender de Key Vault
+    `ADOBE_AJO_WEBHOOK_API_KEY=test-key` como env vars de test; como `KEY_VAULT_URI` no está seteada
+    durante los tests, `SecretCache` opera en modo local (sin `SecretClient`) y resuelve estas env
+    vars directamente, sin depender de Key Vault
   - `jacoco-maven-plugin` `0.8.12`
   - `azure-functions-maven-plugin` `1.42.0` — `resourceGroup=RGDEMOLABV2`,
     `functionAppName=fnctdemolab02`, `location=eastus2` (properties del `pom.xml`, única fuente de
@@ -272,21 +284,15 @@ Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStora
 
 ---
 
-## 9. Decisiones/asunciones a confirmar antes de implementar
+## 9. Puntos abiertos
 
-| # | Decisión | Default asumido en este spec | Impacto si cambia |
-|---|---|---|---|
-| D1 | ¿Cada endpoint Adobe espera el JSON crudo de WhatsApp tal cual, o requiere transformación a un esquema propio de CDP/AJO? | Se envía tal cual (sin mapeo) | Si requiere mapeo, agregar paquete `mapping/` con lógica pura testeable, y schemas/DTOs por endpoint |
-| D2 | Reintentos: cuántos intentos y backoff exacto | 3 intentos, backoff 500ms/1s/2s | Cambia la config del componente de retry y sus tests |
-| D3 | Si CDP y AJO son independientes: ¿un mensaje se reintenta completo si cualquiera falla, o solo se reintenta el envío que falló? | Se reintenta el mensaje completo (más simple, semántica nativa de la cola) — implica posible reenvío duplicado al endpoint que sí tuvo éxito (ver Idempotencia, §5) | Reintento parcial requeriría persistir estado de qué envío ya tuvo éxito (más complejo, no trivial con Queue Trigger simple) |
-
-**Recomendación:** confirmar D1 antes de escribir código (afecta la forma de `AdobeDispatchService`
-y si hace falta un paquete de mapeo); D2 y D3 se pueden ajustar después sin rediseñar la
-arquitectura.
+| # | Pregunta | Estado |
+|---|---|---|
+| D1 | ¿Cada endpoint Adobe espera el JSON crudo de WhatsApp tal cual, o requiere transformación a un esquema propio de CDP/AJO? | Pendiente — los endpoints configurados hoy son mocks de Pipedream (§7.1). Confirmar el formato de payload y el mecanismo de auth reales de Adobe antes de pasar a producción. Si requiere mapeo, agregar un paquete `mapping/` con lógica pura testeable y DTOs por endpoint. |
 
 ---
 
-## 10. `host.json` (referencia, ajustar `batchSize` según necesidad de concurrencia)
+## 10. `host.json` (valores reales del proyecto desplegado)
 
 ```json
 {
@@ -304,12 +310,17 @@ arquitectura.
   "extensions": {
     "queues": {
       "maxDequeueCount": 5,
-      "batchSize": 16,
-      "newBatchThreshold": 8
+      "batchSize": 8,
+      "newBatchThreshold": 4
     }
   }
 }
 ```
+
+`maxDequeueCount` queda como default del extension bundle pero es vestigial para el flujo de fallo
+de negocio: el manejo de errores no depende de reintentos nativos de la cola ni de este valor (la
+Function nunca deja que la excepción se propague — ver §2.1/§5). Solo aplicaría si el propio host
+de Functions fallara antes de que el código de la Function alcance a correr.
 
 ---
 
@@ -357,7 +368,7 @@ Suite JUnit 5 + Mockito, sin llamadas reales a Adobe ni a Azure (HTTP client y `
 mockeados). Estructura espejando `src/main/java`:
 
 ```
-src/test/java/com/example/function/EventDispatcherFunctionTest.java
+src/test/java/com/example/function/WhatsAppProcessFunctionTest.java
 src/test/java/com/example/service/AdobeDispatchServiceTest.java
 src/test/java/com/example/secrets/SecretCacheTest.java
 ```
@@ -382,10 +393,10 @@ degradación ante fallo de Key Vault) — mismo componente, distintos nombres de
 1. Crear los secretos `AdobeCdpAudienceApiKey` / `AdobeAjoWebhookApiKey` en `kvdemolabv2`.
 2. Configurar los App Settings de §7.1 en `fnctdemolab02` (infraestructura de identidad/RBAC ya
    está lista, no recrear).
-3. Confirmar decisión D1 (§9) — formato de payload esperado por cada endpoint Adobe.
+3. Confirmar el punto abierto D1 (§9) — formato de payload esperado por cada endpoint Adobe.
 4. Crear proyecto Maven Java 21 con la estructura y dependencias de §8 (usar
    `whatsapp-webhook-function` como plantilla literal de `pom.xml`/`.funcignore`/`deploy.ps1`).
-5. Implementar `EventDispatcherFunction` (Queue Trigger, capa fina) y `AdobeDispatchService`
+5. Implementar `WhatsAppProcessFunction` (Queue Trigger, capa fina) y `AdobeDispatchService`
    (lógica pura: rate limiting por endpoint, llamadas HTTP, reintentos) según §3.
 6. Reusar `SecretCache` de Function 1 tal cual, cambiando solo los nombres de secreto/env var.
 7. Escribir la suite de tests de §12 (sin dependencias reales de Azure ni Adobe).

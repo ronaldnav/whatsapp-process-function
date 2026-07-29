@@ -26,19 +26,30 @@ public class SecretCache {
             return cached.value;
         }
 
-        String value = resolveFromEnvironment(secretName);
-        if (value != null) {
-            cache.put(secretName, new CachedSecret(value, Instant.now().plus(getCacheTtl())));
-            return value;
-        }
+        String value = secretClient != null
+                ? resolveFromKeyVault(secretName)
+                : resolveFromEnvironmentOrThrow(secretName);
 
+        cache.put(secretName, new CachedSecret(value, Instant.now().plus(getCacheTtl())));
+        return value;
+    }
+
+    private String resolveFromKeyVault(String secretName) {
         try {
-            value = secretClient.getSecret(secretName).getValue();
-            cache.put(secretName, new CachedSecret(value, Instant.now().plus(getCacheTtl())));
-            return value;
+            return secretClient.getSecret(secretName).getValue();
         } catch (Exception ex) {
-            throw new IllegalStateException("Unable to resolve secret " + secretName, ex);
+            throw new IllegalStateException("Unable to resolve secret " + secretName + " from Key Vault", ex);
         }
+    }
+
+    private String resolveFromEnvironmentOrThrow(String secretName) {
+        String value = resolveFromEnvironment(secretName);
+        if (value == null) {
+            throw new IllegalStateException(
+                    "Unable to resolve secret " + secretName
+                            + ": KEY_VAULT_URI is not configured and no local environment variable fallback was found");
+        }
+        return value;
     }
 
     private String resolveFromEnvironment(String secretName) {
@@ -74,10 +85,7 @@ public class SecretCache {
     private SecretClient buildSecretClient() {
         String keyVaultUri = System.getenv("KEY_VAULT_URI");
         if (keyVaultUri == null || keyVaultUri.isBlank()) {
-            return new SecretClientBuilder()
-                    .vaultUrl("https://localhost")
-                    .credential(new DefaultAzureCredentialBuilder().build())
-                    .buildClient();
+            return null;
         }
         return new SecretClientBuilder()
                 .vaultUrl(keyVaultUri)

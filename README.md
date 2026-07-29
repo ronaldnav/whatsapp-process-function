@@ -4,7 +4,7 @@ Proyecto Maven de Azure Functions (Java 21) para despachar eventos de WhatsApp d
 
 ## Estructura
 
-- `src/main/java/com/example/function/EventDispatcherFunction.java`: entry point de la Function.
+- `src/main/java/com/example/function/WhatsAppProcessFunction.java`: entry point de la Function (`@FunctionName("WhatsAppProcess")`).
 - `src/main/java/com/example/service/AdobeDispatchService.java`: lógica de reintentos, rate limiting y HTTP.
 - `src/main/java/com/example/secrets/SecretCache.java`: resolución de secretos con fallback local y caché TTL.
 
