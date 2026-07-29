@@ -1,0 +1,29 @@
+# Azure Functions
+local.settings.json
+bin/
+obj/
+keyvault-appsettings.json
+
+# Maven / Java
+target/
+*.class
+
+# .NET (extensions.csproj build output)
+*.user
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+*.csproj
+
