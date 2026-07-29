@@ -139,7 +139,7 @@ levantar el runtime de Azure Functions ni pegarle a Adobe real.
 
 Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed Identity, cache TTL
 10 min) — reusar tal cual, cambiando únicamente los nombres de secreto/env var. Orden de resolución
-(corregido 2026-07-29 para alinear con Function 1 §5.4):
+(alineado con Function 1 §5.4):
 
 - Si `KEY_VAULT_URI` está seteada → se construye un `SecretClient` real y **Key Vault manda siempre**,
   incluso si la env var también está presente (evita que una API key real quede "pegada" en un App
@@ -202,10 +202,9 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
   trigger de cola, no expone ningún endpoint HTTP.
 - **`ADOBE_DISABLE_SSL_VALIDATION`**: cuando es `true`, `AdobeDispatchService` instala un
   `X509TrustManager` permisivo que acepta cualquier certificado (necesario hoy porque los endpoints
-  configurados son mocks de Pipedream, §9 D1). El default de `set-function-app-settings.ps1` es
-  `false` (corregido 2026-07-29 — antes defaulteaba a `true` si el setting no estaba en
-  `local.settings.json`, empujando el modo inseguro por defecto en cada deploy). **Debe quedar en
-  `false`/ausente antes de apuntar a endpoints reales de Adobe.**
+  configurados son mocks de Pipedream, §9 D1). El default de `set-function-app-settings.ps1` cuando
+  el setting no está presente en `local.settings.json` es `false`. **Debe quedar en `false`/ausente
+  antes de apuntar a endpoints reales de Adobe.**
 
 ---
 
@@ -218,10 +217,10 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
 | RBAC: `Storage Queue Data Contributor` + `Storage Blob Data Contributor` sobre `stgdemolabv2` | ✅ asignado |
 | RBAC: `Key Vault Secrets User` sobre `kvdemolabv2` | ✅ asignado |
 | VNet Integration a `subnet-function-outbound` (`vnedemolabv2`) | ✅ activa |
-| `Enable public access: Off` | ✅ revertido a `Disabled` (2026-07-29) — se togglea a `On` temporalmente para desplegar, ver §11.1 |
+| `Enable public access: Off` (Disabled) | ✅ estado actual — se togglea a `On` temporalmente para desplegar, ver §11.1 |
 | Cola `demolab-queue` en `stgdemolabv2` | ✅ existe |
-| Secretos `AdobeCdpAudienceApiKey` / `AdobeAjoWebhookApiKey` en `kvdemolabv2` | ✅ creados (2026-07-29, valor placeholder `test-key` hasta contar con las API keys reales de Adobe) |
-| App Settings de este proyecto (§7.1) | ❌ **falta configurar** |
+| Secretos `AdobeCdpAudienceApiKey` / `AdobeAjoWebhookApiKey` en `kvdemolabv2` | ✅ creados (valor placeholder `test-key` hasta contar con las API keys reales de Adobe) |
+| App Settings de este proyecto (§7.1) | ✅ configurados, incluye `KEY_VAULT_URI` |
 
 ### 7.1 App Settings requeridos en `fnctdemolab02`
 
@@ -350,12 +349,12 @@ despliegue documentado arriba:
 - **`az functionapp deploy --type zip` tampoco es un workaround**: aunque usa un token AAD (vía
   `az login`) en vez de basic auth, sigue siendo tráfico público — mismo `403` si
   `publicNetworkAccess` está en `Disabled`.
-- **Workaround usado (2026-07-29)**: habilitar temporalmente `publicNetworkAccess: Enabled` en el
-  Function App, desplegar (`az functionapp deploy --resource-group RGDEMOLABV2 --name
-  fnctdemolab02 --src-path <zip-del-staging-dir> --type zip --async false`, empaquetando el
-  contenido de `target\azure-functions\fnctdemolab02\` sin `local.settings.json`), y luego aplicar
-  `set-function-app-settings.ps1`. Queda a criterio de cada despliegue si se vuelve a poner
-  `Disabled` después (no se automatizó).
+- **Workaround**: habilitar temporalmente `publicNetworkAccess: Enabled` en el Function App,
+  desplegar (`az functionapp deploy --resource-group RGDEMOLABV2 --name fnctdemolab02 --src-path
+  <zip-del-staging-dir> --type zip --async false`, empaquetando el contenido de
+  `target\azure-functions\fnctdemolab02\` sin `local.settings.json`), aplicar
+  `set-function-app-settings.ps1`, y volver a poner `publicNetworkAccess: Disabled` (no está
+  automatizado — es un paso manual de cada despliegue).
 - **Alternativa más robusta a futuro** (no implementada): desplegar desde un runner/jumpbox dentro
   de `vnedemolabv2` (o un self-hosted agent de CI/CD en la VNet), para no tener que exponer el SCM
   públicamente en cada despliegue.
