@@ -63,9 +63,11 @@ if (-not $config.Values) {
     throw "No app settings were found in '$SettingsFile'."
 }
 
+$excludedFromSync = @('IsEncrypted', 'AzureWebJobsStorage', 'QueueStorage')
+
 $settingsToApply = New-Object System.Collections.Generic.List[string]
 foreach ($property in $config.Values.PSObject.Properties) {
-    if ($property.Name -eq 'IsEncrypted') {
+    if ($excludedFromSync -contains $property.Name) {
         continue
     }
 
@@ -95,17 +97,8 @@ if (-not ($settingsToApply -contains "ADOBE_DISABLE_SSL_VALIDATION=$adobeSslVali
     $settingsToApply.Add("ADOBE_DISABLE_SSL_VALIDATION=$adobeSslValidation")
 }
 
-$queueStorageConnection = $config.Values.QueueStorage
-$queueStorageAccount = $null
+$queueStorageAccount = "stgdemolabv2"
 $storageEndpointSuffix = "core.windows.net"
-
-if ($queueStorageConnection -and $queueStorageConnection -match 'AccountName=([^;]+)') {
-    $queueStorageAccount = $matches[1]
-}
-
-if (-not $queueStorageAccount) {
-    $queueStorageAccount = "stgdemolabv2"
-}
 
 $queueStorageQueueUri = "https://$queueStorageAccount.queue.$storageEndpointSuffix"
 $queueStorageBlobUri = "https://$queueStorageAccount.blob.$storageEndpointSuffix"
