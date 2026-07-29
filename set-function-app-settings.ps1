@@ -97,25 +97,6 @@ if (-not ($settingsToApply -contains "ADOBE_DISABLE_SSL_VALIDATION=$adobeSslVali
     $settingsToApply.Add("ADOBE_DISABLE_SSL_VALIDATION=$adobeSslValidation")
 }
 
-$queueStorageAccount = "stgdemolabv2"
-$storageEndpointSuffix = "core.windows.net"
-
-$queueStorageQueueUri = "https://$queueStorageAccount.queue.$storageEndpointSuffix"
-$queueStorageBlobUri = "https://$queueStorageAccount.blob.$storageEndpointSuffix"
-
-$managedIdentitySettings = @(
-    "QueueStorage__accountName=$queueStorageAccount",
-    "QueueStorage__credential=managedidentity",
-    "QueueStorage__queueServiceUri=$queueStorageQueueUri",
-    "QueueStorage__blobServiceUri=$queueStorageBlobUri"
-)
-
-foreach ($setting in $managedIdentitySettings) {
-    if (-not ($settingsToApply -contains $setting)) {
-        $settingsToApply.Add($setting)
-    }
-}
-
 if ($settingsToApply.Count -eq 0) {
     Write-Host "No app settings to apply."
     return
