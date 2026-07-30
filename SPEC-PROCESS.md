@@ -46,9 +46,11 @@ public void run(
   proyecto hermano).
 - `message` es el JSON crudo de WhatsApp tal cual lo dejó Function 1 (sin transformar,
   sin re-serializar).
-- Los mensajes que fallan van a una poison queue propia (`demolab-process-poison-queue`, ver §5) —
-  la Function captura el fallo y completa el mensaje original en el primer intento; no depende del
-  dead-letter nativo (`maxDequeueCount`).
+- Los mensajes que fallan van a una poison queue propia (nombre configurable vía app setting
+  `PROCESS_POISON_QUEUE_NAME`, valor real `demolab-process-poison-queue`, ver §5) — la Function
+  captura el fallo y completa el mensaje original en el primer intento; no depende del dead-letter
+  nativo (`maxDequeueCount`). El binding de salida es un `@QueueOutput(name = "waProcessEventsPoison",
+  queueName = "%PROCESS_POISON_QUEUE_NAME%")` — ver §3.2.
 
 ### 2.2 Salida — POST a dos endpoints Adobe
 
@@ -120,7 +122,9 @@ considerar un paquete `mapping/` adicional (ver decisión D1 en §9).
 - `@FunctionName("WhatsAppProcess")`, `@QueueTrigger` (ver §2.1).
 - Responsabilidades: leer las API keys vía `SecretCache`, delegar a `AdobeDispatchService` el envío
   a ambos endpoints, y capturar cualquier excepción para escribir el mensaje en la poison queue
-  propia (`@QueueOutput` a `PROCESS_POISON_QUEUE_NAME`) en vez de dejarla propagar.
+  propia (`@QueueOutput(name = "waProcessEventsPoison", queueName = "%PROCESS_POISON_QUEUE_NAME%")`)
+  en vez de dejarla propagar. El `OutputBinding<String>` solo recibe `setValue(message)` dentro del
+  `catch`; si el dispatch tiene éxito no se escribe nada en la poison queue.
 - No contiene lógica de rate limiting ni de construcción de requests — delega todo a
   `AdobeDispatchService`.
 
@@ -135,11 +139,11 @@ void dispatch(String rawEvent, String cdpApiKey, String ajoApiKey) throws Except
 Testeable con JUnit/Mockito inyectando un `HttpClient` (o wrapper) mockeado — sin necesidad de
 levantar el runtime de Azure Functions ni pegarle a Adobe real.
 
-### 3.4 `SecretCache` (mismo diseño que Function 1)
+### 3.4 `SecretCache` (mismo patrón que Function 1, TTL propio)
 
-Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed Identity, cache TTL
-10 min) — reusar tal cual, cambiando únicamente los nombres de secreto/env var. Orden de resolución
-(alineado con Function 1 §5.4):
+Mismo diseño general que en `whatsapp-webhook-function` (`azure-identity` + Managed Identity, caché
+en memoria con TTL) — reusar tal cual, cambiando únicamente los nombres de secreto/env var. Orden de
+resolución (alineado con Function 1 §5.4):
 
 - Si `KEY_VAULT_URI` está seteada → se construye un `SecretClient` real y **Key Vault manda siempre**,
   incluso si la env var también está presente (evita que una API key real quede "pegada" en un App
@@ -153,6 +157,13 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
 |---|---|
 | `ADOBE_CDP_AUDIENCE_API_KEY` | `AdobeCdpAudienceApiKey` |
 | `ADOBE_AJO_WEBHOOK_API_KEY` | `AdobeAjoWebhookApiKey` |
+
+**TTL de caché**: a diferencia de Function 1 (10 min), en este proyecto el default implementado es
+**24 horas**, configurable vía `SECRET_CACHE_TTL_HOURS` (entero, horas). Sigue el mismo patrón de
+"default configurable" que `AdobeDispatchService` (§5): si `SECRET_CACHE_TTL_HOURS` no está seteada
+o no es parseable, cae a `SECRET_DEFAULT_CACHE_TTL_HOURS` (default interno `24`). Este valor tan
+largo es intencional para minimizar llamadas a Key Vault dado que las API keys de Adobe cambian con
+poca frecuencia; si eso deja de ser cierto, bajar `SECRET_CACHE_TTL_HOURS` en vez de tocar código.
 
 ---
 
@@ -178,6 +189,14 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
   independiente por endpoint — `ADOBE_INITIAL_BACKOFF_MILLIS * intento`. Default: 3 intentos
   (`ADOBE_MAX_ATTEMPTS`), backoff inicial 500ms (`ADOBE_INITIAL_BACKOFF_MILLIS`) →
   500ms/1000ms/1500ms.
+- **Timeout por request HTTP**: `ADOBE_HTTP_TIMEOUT_SECONDS` (default 10s), aplicado vía
+  `HttpRequest.Builder.timeout(...)` — un timeout cuenta como falla transitoria y consume un intento.
+- **Patrón de "default configurable"**: `ADOBE_MAX_ATTEMPTS`, `ADOBE_INITIAL_BACKOFF_MILLIS` y
+  `ADOBE_HTTP_TIMEOUT_SECONDS` son los valores que se leen en caliente; si están ausentes o no son
+  parseables, cada uno cae a su propia variable `ADOBE_DEFAULT_*` (`ADOBE_DEFAULT_MAX_ATTEMPTS=3`,
+  `ADOBE_DEFAULT_INITIAL_BACKOFF_MILLIS=500`, `ADOBE_DEFAULT_HTTP_TIMEOUT_SECONDS=10`) en vez de un
+  literal hardcodeado — permite ajustar el "default" del ambiente sin tocar código, y `SecretCache`
+  usa el mismo patrón para su TTL (§3.4).
 - **Errores no reintentables** (`4xx` de Adobe, payload rechazado): no reintentar contra el mismo
   endpoint — loguear y tratar como fallo definitivo de ese envío.
 - **Mensaje que falla definitivamente**: se completa manualmente (se remueve de `demolab-queue`) y
@@ -231,10 +250,20 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
 | `ADOBE_CDP_AUDIENCE_RATE_LIMIT_TPS` | `30` (opcional, default en código) |
 | `ADOBE_AJO_WEBHOOK_RATE_LIMIT_TPS` | `30` (opcional, default en código) |
 | `QUEUE_NAME` | `demolab-queue` |
+| `PROCESS_POISON_QUEUE_NAME` | `demolab-process-poison-queue` (opcional — si se omite, `set-function-app-settings.ps1` la deriva como `<QUEUE_NAME>-poison`, ver §11) |
 | `QueueStorage__queueServiceUri` | `https://stgdemolabv2.queue.core.windows.net` |
 | `QueueStorage__credential` | `managedidentity` |
 | `KEY_VAULT_URI` | `https://kvdemolabv2.vault.azure.net/` |
 | `FUNCTIONS_WORKER_RUNTIME` | `java` |
+| `ADOBE_HTTP_TIMEOUT_SECONDS` | `10` (opcional, ver §5) |
+| `ADOBE_MAX_ATTEMPTS` | `3` (opcional, ver §5) |
+| `ADOBE_INITIAL_BACKOFF_MILLIS` | `500` (opcional, ver §5) |
+| `ADOBE_DEFAULT_HTTP_TIMEOUT_SECONDS` | `10` (default del default, ver §5) |
+| `ADOBE_DEFAULT_MAX_ATTEMPTS` | `3` (default del default, ver §5) |
+| `ADOBE_DEFAULT_INITIAL_BACKOFF_MILLIS` | `500` (default del default, ver §5) |
+| `ADOBE_DISABLE_SSL_VALIDATION` | `false` en producción (ver §6) — `set-function-app-settings.ps1` fuerza `false` si el setting no está presente en `local.settings.json` |
+| `SECRET_CACHE_TTL_HOURS` | `24` (opcional, ver §3.4) |
+| `SECRET_DEFAULT_CACHE_TTL_HOURS` | `24` (default del default, ver §3.4) |
 
 ### 7.2 Local (`local.settings.json`, no versionado)
 
@@ -246,15 +275,29 @@ Mismo componente que en `whatsapp-webhook-function` (`azure-identity` + Managed 
     "QueueStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "java",
     "QUEUE_NAME": "demolab-queue",
-    "ADOBE_CDP_AUDIENCE_ENDPOINT": "https://<sandbox>.data.adobedc.net/ee/v2/...",
-    "ADOBE_AJO_WEBHOOK_ENDPOINT": "https://<sandbox>.adobe.io/...",
-    "ADOBE_CDP_AUDIENCE_API_KEY": "<api-key-de-prueba>",
-    "ADOBE_AJO_WEBHOOK_API_KEY": "<api-key-de-prueba>",
+    "PROCESS_POISON_QUEUE_NAME": "demolab-process-poison-queue",
+    "ADOBE_CDP_AUDIENCE_ENDPOINT": "https://eoqhdy760jfnbbf.m.pipedream.net",
+    "ADOBE_AJO_WEBHOOK_ENDPOINT": "https://eodwh4be0b3olic.m.pipedream.net",
+    "ADOBE_CDP_AUDIENCE_API_KEY": "test-key",
+    "ADOBE_AJO_WEBHOOK_API_KEY": "test-key",
     "ADOBE_CDP_AUDIENCE_RATE_LIMIT_TPS": "30",
-    "ADOBE_AJO_WEBHOOK_RATE_LIMIT_TPS": "30"
+    "ADOBE_AJO_WEBHOOK_RATE_LIMIT_TPS": "30",
+    "ADOBE_HTTP_TIMEOUT_SECONDS": "10",
+    "ADOBE_MAX_ATTEMPTS": "3",
+    "ADOBE_INITIAL_BACKOFF_MILLIS": "500",
+    "ADOBE_DEFAULT_HTTP_TIMEOUT_SECONDS": "10",
+    "ADOBE_DEFAULT_MAX_ATTEMPTS": "3",
+    "ADOBE_DEFAULT_INITIAL_BACKOFF_MILLIS": "500",
+    "ADOBE_DISABLE_SSL_VALIDATION": "true",
+    "SECRET_CACHE_TTL_HOURS": "24",
+    "SECRET_DEFAULT_CACHE_TTL_HOURS": "24"
   }
 }
 ```
+
+En el proyecto real, `ADOBE_CDP_AUDIENCE_ENDPOINT`/`ADOBE_AJO_WEBHOOK_ENDPOINT` apuntan hoy a dos
+endpoints mock de Pipedream (ver §9 D1) y `ADOBE_DISABLE_SSL_VALIDATION` está en `true` localmente
+porque esos mocks no requieren TLS estricto — **no copiar `true` a producción** (§6).
 
 Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStorage`
 (`UseDevelopmentStorage=true` no soporta managed identity, igual que en Function 1).
@@ -271,8 +314,8 @@ Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStora
 - Cliente HTTP: `java.net.http.HttpClient` (JDK 21, sin dependencia externa)
 - Test: `junit-jupiter` `5.10.2`, `mockito-core` + `mockito-junit-jupiter` `5.11.0`
 - Plugins de build (idénticos a Function 1):
-  - `maven-compiler-plugin` (release 21)
-  - `maven-surefire-plugin` — inyecta `ADOBE_CDP_AUDIENCE_API_KEY=test-key` /
+  - `maven-compiler-plugin` `3.13.0` (release 21)
+  - `maven-surefire-plugin` `3.2.5` — inyecta `ADOBE_CDP_AUDIENCE_API_KEY=test-key` /
     `ADOBE_AJO_WEBHOOK_API_KEY=test-key` como env vars de test; como `KEY_VAULT_URI` no está seteada
     durante los tests, `SecretCache` opera en modo local (sin `SecretClient`) y resuelve estas env
     vars directamente, sin depender de Key Vault
@@ -280,6 +323,9 @@ Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStora
   - `azure-functions-maven-plugin` `1.42.0` — `resourceGroup=RGDEMOLABV2`,
     `functionAppName=fnctdemolab02`, `location=eastus2` (properties del `pom.xml`, única fuente de
     verdad, igual que en Function 1)
+- `groupId`/`artifactId`/`version`: `com.example` / `whatsapp-process-function` / `1.0-SNAPSHOT`,
+  `packaging=jar`.
+- `.funcignore` (excluye del paquete de despliegue): `target/`, `.git/`, `.vscode/`, `README.md`.
 
 ---
 
@@ -288,6 +334,23 @@ Requiere **Azurite** corriendo localmente para `AzureWebJobsStorage`/`QueueStora
 | # | Pregunta | Estado |
 |---|---|---|
 | D1 | ¿Cada endpoint Adobe espera el JSON crudo de WhatsApp tal cual, o requiere transformación a un esquema propio de CDP/AJO? | Pendiente — los endpoints configurados hoy son mocks de Pipedream (§7.1). Confirmar el formato de payload y el mecanismo de auth reales de Adobe antes de pasar a producción. Si requiere mapeo, agregar un paquete `mapping/` con lógica pura testeable y DTOs por endpoint. |
+
+### 9.1 Roadmap (documentado en `README.md`, no implementado)
+
+No forma parte del alcance actual (§1) pero está declarado como trabajo futuro y condiciona
+decisiones de diseño (p. ej. no asumir que `TokenBucketRateLimiter` seguirá siendo local-only):
+
+- **Rate limiter distribuido**: centralizar `TokenBucketRateLimiter` (CDP y AJO) en Redis para que
+  el límite de 30 TPS sea global entre instancias de la Function App, no por instancia (hoy el
+  limiter es un singleton en memoria de proceso — válido mientras la Function App corra con una
+  sola instancia efectiva, se rompe con escalado horizontal).
+- **Correlación con el envío original**: crear una Function separada de envío de WhatsApp que
+  almacene en Redis el `wamid` y el teléfono de cada mensaje saliente; `WhatsAppProcessFunction`
+  consultaría ese `wamid` en Redis para enriquecer el evento con el teléfono/contexto del envío
+  original antes de reenviarlo a Adobe.
+- **Infraestructura propuesta**: Azure Managed Redis, tier Balanced B1, Two-Node (High
+  Availability), con Private Link en la VNet (sin acceso público, Private DNS Zone) — se descarta
+  Azure Cache for Redis clásico por su retiro anunciado para el 30/04/2028.
 
 ---
 
@@ -336,6 +399,25 @@ func azure functionapp publish fnctdemolab02
 `deploy.ps1` análogo al de `whatsapp-webhook-function`: lee `resourceGroup`/`functionAppName` desde
 `pom.xml`, copia `.funcignore` al staging dir, publica desde ahí.
 
+> **Detalle cosmético a replicar o corregir**: el mensaje final de `deploy.ps1` imprime
+> `https://$FuncApp.azurewebsites.net/api/whatsapp` como si la Function expusiera un endpoint HTTP —
+> es un remanente copiado de la plantilla de Function 1 (que sí es HTTP Trigger). Este proyecto es
+> **Queue Trigger puro** (§1) y no expone esa ruta; el mensaje es inofensivo pero engañoso. Si se
+> replica el script, considerar ajustar ese mensaje final en vez de copiarlo literal.
+
+`set-function-app-settings.ps1` (también análogo al de Function 1) sincroniza `local.settings.json`
+→ App Settings de `fnctdemolab02` vía `az functionapp config appsettings set`, con estas reglas
+propias del proyecto:
+
+- Excluye de la sincronización `IsEncrypted`, `AzureWebJobsStorage` y `QueueStorage` (esta última no
+  aplica en Azure porque ahí la conexión se resuelve vía `QueueStorage__queueServiceUri` +
+  `QueueStorage__credential=managedidentity`, §7.1 — no por connection string).
+- Si `PROCESS_POISON_QUEUE_NAME` no está presente en `local.settings.json`, la deriva como
+  `<QUEUE_NAME>-poison`, o `demolab-poison-queue` si tampoco hay `QUEUE_NAME`.
+- Fuerza `ADOBE_DISABLE_SSL_VALIDATION=false` si el setting no está presente en
+  `local.settings.json` — evita que production quede sin el setting y con el default inseguro del
+  código (ver §6).
+
 ### 11.1 Nota: `publicNetworkAccess` bloquea `func azure functionapp publish`
 
 `fnctdemolab02` solo es alcanzable por su private endpoint en `vnedemolabv2` cuando
@@ -372,18 +454,28 @@ src/test/java/com/example/service/AdobeDispatchServiceTest.java
 src/test/java/com/example/secrets/SecretCacheTest.java
 ```
 
-Casos mínimos a cubrir en `AdobeDispatchServiceTest`:
+Casos cubiertos en `AdobeDispatchServiceTest` (nombres reales de los `@Test`):
 
 | Test | Escenario | Resultado esperado |
 |---|---|---|
-| `dispatch_sendsToBothEndpoints_whenBothSucceed` | Ambas llamadas HTTP devuelven 2xx | No lanza excepción, se llamó una vez a cada endpoint |
+| `dispatch_sendsToBothEndpoints_whenBothSucceed` | Ambas llamadas HTTP devuelven 2xx | No lanza excepción |
 | `dispatch_throws_whenCdpFailsAfterRetries` | CDP devuelve 5xx en todos los reintentos | Lanza excepción tras agotar reintentos |
 | `dispatch_throws_whenAjoFailsAfterRetries` | AJO devuelve 5xx en todos los reintentos | Lanza excepción tras agotar reintentos |
+| `dispatch_stillCallsAjo_whenCdpFailsAfterRetries` | CDP falla, AJO responde 2xx | AJO se llama igual (exactamente 1 vez) aunque CDP ya haya fallado; igual lanza excepción combinada porque CDP falló |
 | `dispatch_doesNotRetry_on4xxResponse` | Endpoint devuelve 4xx | No reintenta ese envío, falla directo |
-| `dispatch_respectsRateLimit_perEndpoint` | Ráfaga de invocaciones concurrentes | El rate limiter aplica backpressure, no se exceden los TPS configurados |
+| `dispatch_waitsForPermit_whenUsingTokenBucketRateLimiter` | Un `TokenBucketRateLimiter(1)` compartido entre CDP y AJO, ambos envíos exitosos | El segundo `acquire()` espera (≥900ms medidos), confirma backpressure real, no solo mockeado |
 
-`SecretCacheTest` reusa exactamente los casos de Function 1 (fallback env var, cache TTL, refresco,
-degradación ante fallo de Key Vault) — mismo componente, distintos nombres de secreto.
+Casos cubiertos en `SecretCacheTest` (no reproduce el TTL/refresco/degradación de Función 1 como
+antes se documentaba aquí — son solo 3 casos, más simples):
+
+| Test | Escenario | Resultado esperado |
+|---|---|---|
+| `getSecret_usesEnvironmentFallbackWhenNoKeyVaultConfigured` | `SecretClient` nulo (modo local) | Resuelve vía env var (`test-key` inyectado por Surefire) |
+| `getSecret_prefersKeyVaultOverEnvironmentWhenConfigured` | `SecretClient` mockeado devuelve un valor distinto al de la env var | Key Vault gana aunque la env var esté presente |
+| `getSecret_throwsClearErrorWhenNoKeyVaultAndNoEnvironmentFallback` | Secreto no mapeado (`UnmappedSecret`), sin `SecretClient` | Lanza `IllegalStateException` |
+
+Si se quiere replicar cobertura de TTL/expiración/degradación ante fallo de Key Vault (como en
+Function 1), son casos a **agregar**, no a asumir como ya existentes.
 
 ---
 
@@ -400,7 +492,9 @@ degradación ante fallo de Key Vault) — mismo componente, distintos nombres de
 6. Reusar `SecretCache` de Function 1 tal cual, cambiando solo los nombres de secreto/env var.
 7. Escribir la suite de tests de §12 (sin dependencias reales de Azure ni Adobe).
 8. Configurar `host.json` (§10), `local.settings.json` (§7.2, gitignored), `.funcignore`.
-9. Escribir `deploy.ps1` (§11).
+9. Escribir `deploy.ps1` y `set-function-app-settings.ps1` (§11).
 10. Probar en local contra Azurite + mocks/sandbox de Adobe antes de desplegar a `fnctdemolab02`.
 11. Desplegar y validar end-to-end: encolar un mensaje de prueba en `demolab-queue` y confirmar que
     llega a ambos endpoints Adobe (o a sus sandbox/mocks), respetando el rate limit configurado.
+12. Revisar el roadmap (§9.1) antes de tomar decisiones de diseño que asuman una sola instancia de
+    la Function App (p. ej. el rate limiter en memoria) — es trabajo declarado, no descartado.
